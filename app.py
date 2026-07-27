@@ -587,6 +587,13 @@ def draw_sparkline(canvas: tk.Canvas, values: List[float], x: float, y: float, w
     canvas.create_line(*pts, fill=color, width=2, smooth=True)
 
 
+def downsample(values: List[float], num_points: int = 90) -> List[float]:
+    if len(values) <= num_points:
+        return values
+    indices = [int(i * (len(values) - 1) / (num_points - 1)) for i in range(num_points)]
+    return [values[idx] for idx in indices]
+
+
 def draw_line_chart(
     canvas: tk.Canvas,
     x: float,
@@ -597,6 +604,7 @@ def draw_line_chart(
     max_value: Optional[float] = None,
     y_labels: Optional[List[str]] = None,
     fill_first: bool = False,
+    time_labels: Optional[List[str]] = None,
 ) -> None:
     # grid
     left_pad = 44
@@ -616,7 +624,7 @@ def draw_line_chart(
         xx = plot_x + i * plot_w / 6
         canvas.create_line(xx, plot_y, xx, plot_y + plot_h, fill="#1f2a3c", dash=(2, 5))
     # labels tiempo falsos/relativos sobrios
-    times = ["-60m", "-50m", "-40m", "-30m", "-20m", "-10m", "ahora"]
+    times = time_labels if time_labels else ["-60m", "-50m", "-40m", "-30m", "-20m", "-10m", "ahora"]
     for i, label in enumerate(times):
         xx = plot_x + i * plot_w / 6
         canvas.create_text(xx, y + h - 10, text=label, fill=C["muted"], font=(FONT, 7))
@@ -627,7 +635,7 @@ def draw_line_chart(
     max_val = max_value if max_value else max(max(all_values), 1)
     min_val = 0.0
     for idx, (_name, vals, color) in enumerate(series):
-        vals = vals[-90:]
+        vals = downsample(vals, 90)
         if len(vals) < 2:
             vals = [random.uniform(0, max_val * 0.3) for _ in range(24)]
         pts: List[float] = []
@@ -697,6 +705,10 @@ class ModernMonitorApp(tk.Tk):
             "load15": [],
         }
         self.core_history: List[List[float]] = []
+        self.is_paused = False
+        self.refresh_interval = 1.5
+        self.time_range = "1 Hour"
+        self.overview_sort_by = "CPU"
 
         self._configure_styles()
         self._build_shell()
@@ -761,8 +773,7 @@ class ModernMonitorApp(tk.Tk):
         spacer.pack(fill="both", expand=True)
         self.thread_label = tk.Label(self.sidebar, text="threads: starting", fg=C["muted"], bg=C["sidebar"], font=(FONT, 8))
         self.thread_label.pack(anchor="w", padx=18, pady=(0, 8))
-        tk.Label(self.sidebar, text="⚙  Settings", fg=C["text"], bg=C["sidebar"], font=(FONT, 10)).pack(anchor="w", padx=22, pady=(0, 22))
-        tk.Label(self.sidebar, text="ⓘ  /proc · SQLite", fg=C["muted"], bg=C["sidebar"], font=(FONT, 8)).pack(anchor="w", padx=22, pady=(0, 20))
+        tk.Label(self.sidebar, text="ⓘ  /proc · SQLite", fg=C["muted"], bg=C["sidebar"], font=(FONT, 8)).pack(anchor="w", padx=22, pady=(0, 24))
 
         self.main = tk.Frame(self, bg=C["bg"])
         self.main.pack(side="left", fill="both", expand=True)
@@ -796,6 +807,36 @@ class ModernMonitorApp(tk.Tk):
             canvas.bind("<Configure>", lambda _e, n=name: self.redraw(n))
             self.pages[name] = frame
             self.canvas_pages[name] = canvas
+            if name == "overview":
+                def on_focus_in(event):
+                    if self.overview_search_var.get() == "Search applications...":
+                        self.overview_search_var.set("")
+                        self.overview_search_entry.config(fg=C["text"])
+
+                def on_focus_out(event):
+                    if not self.overview_search_var.get().strip():
+                        self.overview_search_var.set("Search applications...")
+                        self.overview_search_entry.config(fg=C["muted"])
+
+                def on_search_change(*args):
+                    self.redraw("overview")
+
+                self.overview_search_var = tk.StringVar(value="Search applications...")
+                self.overview_search_var.trace_add("write", on_search_change)
+                self.overview_search_entry = tk.Entry(
+                    canvas,
+                    textvariable=self.overview_search_var,
+                    bg=C["panel2"],
+                    fg=C["muted"],
+                    insertbackground=C["text"],
+                    relief="flat",
+                    font=(FONT, 9),
+                    bd=0,
+                    highlightthickness=0
+                )
+                self.overview_search_entry.bind("<FocusIn>", on_focus_in)
+                self.overview_search_entry.bind("<FocusOut>", on_focus_out)
+
         self._build_records_page()
         self._build_commands_page()
 
@@ -837,7 +878,7 @@ class ModernMonitorApp(tk.Tk):
                 self.events.put(("metrics", self.probe.collect_metrics()))
             except Exception as exc:
                 self.events.put(("log", f"Error métricas: {exc}"))
-            self.stop_event.wait(1.5)
+            self.stop_event.wait(self.refresh_interval)
 
     def _process_worker(self) -> None:
         while not self.stop_event.is_set():
@@ -845,7 +886,7 @@ class ModernMonitorApp(tk.Tk):
                 self.events.put(("processes", self.probe.top_processes(80)))
             except Exception as exc:
                 self.events.put(("log", f"Error procesos: {exc}"))
-            self.stop_event.wait(3.5)
+            self.stop_event.wait(max(3.5, self.refresh_interval * 2.5))
 
     def _drain_events(self) -> None:
         while True:
@@ -855,11 +896,13 @@ class ModernMonitorApp(tk.Tk):
                 break
             if kind == "metrics":
                 self.latest = payload
-                self._append_history(payload)
-                self.redraw(self.page)
+                if not self.is_paused:
+                    self._append_history(payload)
+                    self.redraw(self.page)
             elif kind == "processes":
-                self.processes = payload
-                self.redraw(self.page)
+                if not self.is_paused:
+                    self.processes = payload
+                    self.redraw(self.page)
             elif kind == "log":
                 print(payload)
         self.thread_label.configure(text=f"threads: {int(self.metric_thread.is_alive()) + int(self.process_thread.is_alive())}/2 active")
@@ -885,13 +928,13 @@ class ModernMonitorApp(tk.Tk):
         }
         for key, value in pairs.items():
             self.history.setdefault(key, []).append(value)
-            self.history[key] = self.history[key][-100:]
+            self.history[key] = self.history[key][-2400:]
         per_core = cpu.get("per_core", []) or []
         while len(self.core_history) < len(per_core):
             self.core_history.append([])
         for i, value in enumerate(per_core):
             self.core_history[i].append(safe_float(value))
-            self.core_history[i] = self.core_history[i][-100:]
+            self.core_history[i] = self.core_history[i][-2400:]
 
     # ---------- Canvas render ----------
     def redraw(self, name: Optional[str] = None) -> None:
@@ -905,6 +948,44 @@ class ModernMonitorApp(tk.Tk):
         elif name == "processes":
             self.draw_processes()
 
+    def on_sort_click(self, event) -> None:
+        menu = tk.Menu(self, tearoff=0, bg=C["panel2"], fg=C["text"], activebackground=C["purple"], activeforeground=C["text"])
+        options = ["CPU", "Memory", "PID", "Name", "Disk Read", "Disk Write"]
+        for opt in options:
+            menu.add_command(label=opt, command=lambda o=opt: self.set_overview_sort_by(o))
+        menu.post(event.x_root, event.y_root)
+
+    def set_overview_sort_by(self, val: str) -> None:
+        self.overview_sort_by = val
+        self.redraw("overview")
+
+    def _get_filtered_and_sorted_processes(self) -> List[Dict[str, Any]]:
+        query = self.overview_search_var.get().strip().lower()
+        if query == "search applications...":
+            query = ""
+        procs = list(self.processes)
+        if query:
+            procs = [
+                p for p in procs
+                if query in str(p.get("name", "")).lower()
+                or query in str(p.get("pid", "")).lower()
+                or query in str(p.get("user", "")).lower()
+            ]
+        sort_key_map = {
+            "CPU": lambda x: safe_float(x.get("cpu")),
+            "Memory": lambda x: safe_float(x.get("mem_pct")),
+            "PID": lambda x: safe_int(x.get("pid")),
+            "Name": lambda x: str(x.get("name", "")).lower(),
+            "Disk Read": lambda x: safe_int(x.get("read_bytes")),
+            "Disk Write": lambda x: safe_int(x.get("write_bytes")),
+        }
+        key_fn = sort_key_map.get(self.overview_sort_by, lambda x: safe_float(x.get("cpu")))
+        reverse = True
+        if self.overview_sort_by == "Name":
+            reverse = False
+        procs.sort(key=key_fn, reverse=reverse)
+        return procs
+
     def draw_overview(self) -> None:
         canvas = self.canvas_pages["overview"]
         canvas.delete("all")
@@ -917,7 +998,6 @@ class ModernMonitorApp(tk.Tk):
         disk = self.latest.get("disk", {})
         net = self.latest.get("network", {})
         active = net.get("active", {}) if isinstance(net, dict) else {}
-        processes = self.processes[:8]
 
         card_h = 188
         card_w = (w - 2 * m - 2 * gap) / 3
@@ -1001,11 +1081,27 @@ class ModernMonitorApp(tk.Tk):
         th = max(230, h - ty - 58)
         draw_panel(canvas, m, ty, w - 2 * m, th, "Top Applications", "▥")
         search_x = w - m - 396
+        
+        # Draw search box container on canvas
         rounded_rect(canvas, search_x, ty + 14, search_x + 190, ty + 48, 8, C["panel2"], C["border"])
-        canvas.create_text(search_x + 14, ty + 31, text="⌕  Search applications...", fill=C["muted"], font=(FONT, 9), anchor="w")
-        rounded_rect(canvas, search_x + 204, ty + 14, search_x + 340, ty + 48, 8, C["panel2"], C["border"])
-        canvas.create_text(search_x + 222, ty + 31, text="Sort by CPU  ⌄", fill=C["text"], font=(FONT, 9), anchor="w")
-        self._draw_process_table(canvas, m + 12, ty + 62, w - 2 * m - 24, th - 112, processes, compact=True)
+        canvas.create_text(search_x + 14, ty + 31, text="⌕", fill=C["muted"], font=(FONT, 10), anchor="w")
+        canvas.create_window(search_x + 28, ty + 31, window=self.overview_search_entry, width=150, height=24, anchor="w")
+
+        # Draw sort button container
+        r_sort = rounded_rect(canvas, search_x + 204, ty + 14, search_x + 340, ty + 48, 8, C["panel2"], C["border"])
+        t_sort = canvas.create_text(search_x + 222, ty + 31, text=f"Sort by {self.overview_sort_by}  ⌄", fill=C["text"], font=(FONT, 9), anchor="w")
+        
+        # Bind click to sort dropdown
+        canvas.tag_bind(r_sort, "<Button-1>", self.on_sort_click)
+        canvas.tag_bind(t_sort, "<Button-1>", self.on_sort_click)
+        canvas.tag_bind(r_sort, "<Enter>", lambda e: canvas.config(cursor="hand2"))
+        canvas.tag_bind(r_sort, "<Leave>", lambda e: canvas.config(cursor=""))
+        canvas.tag_bind(t_sort, "<Enter>", lambda e: canvas.config(cursor="hand2"))
+        canvas.tag_bind(t_sort, "<Leave>", lambda e: canvas.config(cursor=""))
+
+        # Fetch filtered and sorted processes
+        filtered_processes = self._get_filtered_and_sorted_processes()
+        self._draw_process_table(canvas, m + 12, ty + 62, w - 2 * m - 24, th - 112, filtered_processes[:8], compact=True)
         # Bottom stats
         by = ty + th - 50
         labels = [
@@ -1030,6 +1126,59 @@ class ModernMonitorApp(tk.Tk):
         s = int(seconds % 60)
         return f"{h}h {m}m {s}s"
 
+    def _slice_list(self, vals: List[float]) -> List[float]:
+        if not vals:
+            return []
+        seconds_map = {
+            "1 Hour": 3600,
+            "10 Min": 600,
+            "5 Min": 300,
+            "1 Min": 60,
+        }
+        sec = seconds_map.get(self.time_range, 3600)
+        num_points = int(sec / max(self.refresh_interval, 0.1))
+        return vals[-num_points:]
+
+    def _get_history_slice(self, key: str) -> List[float]:
+        return self._slice_list(self.history.get(key, []))
+
+    def _get_time_labels(self) -> List[str]:
+        if self.time_range == "1 Hour":
+            return ["-60m", "-50m", "-40m", "-30m", "-20m", "-10m", "ahora"]
+        elif self.time_range == "10 Min":
+            return ["-10m", "-8m", "-6m", "-4m", "-2m", "-1m", "ahora"]
+        elif self.time_range == "5 Min":
+            return ["-5m", "-4m", "-3m", "-2m", "-1m", "-30s", "ahora"]
+        elif self.time_range == "1 Min":
+            return ["-60s", "-50s", "-40s", "-30s", "-20s", "-10s", "ahora"]
+        return ["-60m", "-50m", "-40m", "-30m", "-20m", "-10m", "ahora"]
+
+    def on_time_range_click(self, event) -> None:
+        menu = tk.Menu(self, tearoff=0, bg=C["panel2"], fg=C["text"], activebackground=C["purple"], activeforeground=C["text"])
+        options = ["1 Hour", "10 Min", "5 Min", "1 Min"]
+        for opt in options:
+            menu.add_command(label=opt, command=lambda o=opt: self.set_time_range(o))
+        menu.post(event.x_root, event.y_root)
+
+    def set_time_range(self, val: str) -> None:
+        self.time_range = val
+        self.redraw()
+
+    def on_refresh_click(self, event) -> None:
+        menu = tk.Menu(self, tearoff=0, bg=C["panel2"], fg=C["text"], activebackground=C["purple"], activeforeground=C["text"])
+        options = [("1s", 1.0), ("1.5s", 1.5), ("3s", 3.0), ("5s", 5.0), ("10s", 10.0)]
+        for label, val in options:
+            menu.add_command(label=label, command=lambda v=val: self.set_refresh_interval(v))
+        menu.post(event.x_root, event.y_root)
+
+    def set_refresh_interval(self, val: float) -> None:
+        self.refresh_interval = val
+        self.redraw()
+
+    def on_pause_click(self, event) -> None:
+        self.is_paused = not self.is_paused
+        self.redraw()
+
     def draw_history(self) -> None:
         canvas = self.canvas_pages["history"]
         canvas.delete("all")
@@ -1037,28 +1186,50 @@ class ModernMonitorApp(tk.Tk):
         h = max(canvas.winfo_height(), 700)
         m = 24
         gap = 12
+
+        time_range_labels = {
+            "1 Hour": "Last 1 H",
+            "10 Min": "Last 10 M",
+            "5 Min": "Last 5 M",
+            "1 Min": "Last 1 M",
+        }
+        tr_text = f"Time Range  {time_range_labels.get(self.time_range, 'Last 1 H')} ⌄"
+        ref_text = f"Refresh  {self.refresh_interval}s ⌄"
+
         # controls
-        rounded_rect(canvas, w - 398, 16, w - 268, 48, 8, C["panel2"], C["border"])
-        canvas.create_text(w - 386, 32, text="Time Range   Last 1 Hour⌄", fill=C["text"], font=(FONT, 9), anchor="w")
-        rounded_rect(canvas, w - 254, 16, w - 142, 48, 8, C["panel2"], C["border"])
-        canvas.create_text(w - 242, 32, text="Refresh   5s⌄", fill=C["text"], font=(FONT, 9), anchor="w")
-        rounded_rect(canvas, w - 128, 16, w - 40, 48, 8, C["panel2"], C["border"])
-        canvas.create_text(w - 84, 32, text="Ⅱ  Pause", fill=C["text"], font=(FONT, 9, "bold"))
+        r1 = rounded_rect(canvas, w - 418, 16, w - 268, 48, 8, C["panel2"], C["border"])
+        t1 = canvas.create_text(w - 406, 32, text=tr_text, fill=C["text"], font=(FONT, 9), anchor="w")
+        canvas.tag_bind(r1, "<Button-1>", self.on_time_range_click)
+        canvas.tag_bind(t1, "<Button-1>", self.on_time_range_click)
+
+        r2 = rounded_rect(canvas, w - 254, 16, w - 142, 48, 8, C["panel2"], C["border"])
+        t2 = canvas.create_text(w - 242, 32, text=ref_text, fill=C["text"], font=(FONT, 9), anchor="w")
+        canvas.tag_bind(r2, "<Button-1>", self.on_refresh_click)
+        canvas.tag_bind(t2, "<Button-1>", self.on_refresh_click)
+
+        r3 = rounded_rect(canvas, w - 128, 16, w - 40, 48, 8, "#4a2435" if self.is_paused else C["panel2"], C["border"])
+        t3 = canvas.create_text(w - 84, 32, text="▶  Resume" if self.is_paused else "Ⅱ  Pause", fill=C["pink"] if self.is_paused else C["text"], font=(FONT, 9, "bold"))
+        canvas.tag_bind(r3, "<Button-1>", self.on_pause_click)
+        canvas.tag_bind(t3, "<Button-1>", self.on_pause_click)
+
+        for item in [r1, t1, r2, t2, r3, t3]:
+            canvas.tag_bind(item, "<Enter>", lambda e: canvas.config(cursor="hand2"))
+            canvas.tag_bind(item, "<Leave>", lambda e: canvas.config(cursor=""))
 
         top = 66
         chart_h = (h - top - 92) / 3
         chart_w = (w - 2 * m - gap) / 2
         panels = [
-            (m, top, chart_w, chart_h, "CPU Usage", [("Total Usage", self.history.get("cpu", []), C["purple"])], 100, ["100%", "75%", "50%", "25%", "0%"], True),
+            (m, top, chart_w, chart_h, "CPU Usage", [("Total Usage", self._get_history_slice("cpu"), C["purple"])], 100, ["100%", "75%", "50%", "25%", "0%"], True),
             (m + chart_w + gap, top, chart_w, chart_h, "CPU Usage per Core", self._core_series(), 100, ["100%", "75%", "50%", "25%", "0%"], False),
-            (m, top + chart_h + gap, chart_w, chart_h, "Memory Usage", [("Used", self.history.get("mem", []), C["purple2"]), ("Cached", [v * 0.34 for v in self.history.get("mem", [])], C["cyan"]), ("Buffers", [3 for _ in self.history.get("mem", [])], C["mint"])], 100, ["100%", "75%", "50%", "25%", "0%"], True),
-            (m + chart_w + gap, top + chart_h + gap, chart_w, chart_h, "Network Activity", [("Download Rate", self.history.get("net_down", []), C["blue"]), ("Upload Rate", self.history.get("net_up", []), C["pink"])], max(max(self.history.get("net_down", [1]) + self.history.get("net_up", [1])), 1), ["max", "", "", "", "0"], True),
-            (m, top + 2 * (chart_h + gap), chart_w, chart_h, "Disk Activity", [("Read Speed", self.history.get("disk_read", []), C["blue"]), ("Write Speed", self.history.get("disk_write", []), C["pink"]), ("I/O", [v * 0.2 for v in self.history.get("disk_read", [])], C["amber"])], max(max(self.history.get("disk_read", [1]) + self.history.get("disk_write", [1])), 1), ["max", "", "", "", "0"], False),
-            (m + chart_w + gap, top + 2 * (chart_h + gap), chart_w, chart_h, "Swap Usage", [("Used Swap", self.history.get("swap", []), C["pink"])], 100, ["100%", "75%", "50%", "25%", "0%"], True),
+            (m, top + chart_h + gap, chart_w, chart_h, "Memory Usage", [("Used", self._get_history_slice("mem"), C["purple2"]), ("Cached", [v * 0.34 for v in self._get_history_slice("mem")], C["cyan"]), ("Buffers", [3 for _ in self._get_history_slice("mem")], C["mint"])], 100, ["100%", "75%", "50%", "25%", "0%"], True),
+            (m + chart_w + gap, top + chart_h + gap, chart_w, chart_h, "Network Activity", [("Download Rate", self._get_history_slice("net_down"), C["blue"]), ("Upload Rate", self._get_history_slice("net_up"), C["pink"])], max(max(self._get_history_slice("net_down") + self._get_history_slice("net_up") + [1]), 1), ["max", "", "", "", "0"], True),
+            (m, top + 2 * (chart_h + gap), chart_w, chart_h, "Disk Activity", [("Read Speed", self._get_history_slice("disk_read"), C["blue"]), ("Write Speed", self._get_history_slice("disk_write"), C["pink"]), ("I/O", [v * 0.2 for v in self._get_history_slice("disk_read")], C["amber"])], max(max(self._get_history_slice("disk_read") + self._get_history_slice("disk_write") + [1]), 1), ["max", "", "", "", "0"], False),
+            (m + chart_w + gap, top + 2 * (chart_h + gap), chart_w, chart_h, "Swap Usage", [("Used Swap", self._get_history_slice("swap"), C["pink"])], 100, ["100%", "75%", "50%", "25%", "0%"], True),
         ]
         for x, y, cw, ch, title, series, maxv, labels, fill_first in panels:
             draw_panel(canvas, x, y, cw, ch, title)
-            draw_line_chart(canvas, x + 6, y + 34, cw - 12, ch - 50, series, maxv, labels, fill_first)
+            draw_line_chart(canvas, x + 6, y + 34, cw - 12, ch - 50, series, maxv, labels, fill_first, time_labels=self._get_time_labels())
             # leyenda compacta
             lx = x + 20
             ly = y + ch - 20
@@ -1067,7 +1238,7 @@ class ModernMonitorApp(tk.Tk):
                 canvas.create_oval(lx, ly - 4, lx + 8, ly + 4, fill=color, outline="")
                 canvas.create_text(lx + 14, ly, text=f"{name}  {value:.1f}", fill=C["text"], font=(FONT, 8), anchor="w")
                 lx += 110
-        # load average full bottom overlay if enough height not used? draw small metric labels top right
+        # load average average bottom
         load_y = h - 64
         rounded_rect(canvas, m, load_y, w - m, h - 20, 12, C["panel"], C["border"])
         canvas.create_text(m + 18, load_y + 22, text="Load Average", fill=C["text"], font=(FONT, 11, "bold"), anchor="w")
@@ -1079,12 +1250,102 @@ class ModernMonitorApp(tk.Tk):
         colors = [C["purple"], C["pink"], C["amber"], C["yellow"], C["mint"], C["green"], C["cyan"], C["blue"], C["coral"], C["purple2"]]
         series = []
         for i, vals in enumerate(self.core_history[:10]):
-            series.append((f"Core {i + 1}", vals, colors[i % len(colors)]))
+            series.append((f"Core {i + 1}", self._slice_list(vals), colors[i % len(colors)]))
         return series or [("Core 1", [], C["purple"])]
 
     def _last(self, key: str) -> float:
         vals = self.history.get(key, [])
         return safe_float(vals[-1] if vals else 0)
+
+    def _get_aggregated_applications(self) -> List[Dict[str, Any]]:
+        try:
+            current_user = pwd.getpwuid(os.getuid()).pw_name
+        except Exception:
+            current_user = os.environ.get("USER", "grimroot")
+        
+        apps: Dict[str, Dict[str, Any]] = {}
+        for p in self.processes:
+            if p.get("user") != current_user:
+                continue
+            name = p.get("name", "?")
+            if name.startswith("[") and name.endswith("]"):
+                continue
+            base_name = os.path.basename(name)
+            if base_name not in apps:
+                apps[base_name] = {
+                    "name": base_name,
+                    "count": 1,
+                    "cpu": safe_float(p.get("cpu")),
+                    "mem_pct": safe_float(p.get("mem_pct")),
+                    "rss_kb": safe_int(p.get("rss_kb")),
+                    "read_bytes": safe_float(p.get("read_bytes")),
+                    "write_bytes": safe_float(p.get("write_bytes")),
+                }
+            else:
+                apps[base_name]["count"] += 1
+                apps[base_name]["cpu"] += safe_float(p.get("cpu"))
+                apps[base_name]["mem_pct"] += safe_float(p.get("mem_pct"))
+                apps[base_name]["rss_kb"] += safe_int(p.get("rss_kb"))
+                apps[base_name]["read_bytes"] += safe_float(p.get("read_bytes"))
+                apps[base_name]["write_bytes"] += safe_float(p.get("write_bytes"))
+        
+        app_list = list(apps.values())
+        app_list.sort(key=lambda x: x["cpu"], reverse=True)
+        return app_list
+
+    def _draw_applications_table(self, canvas: tk.Canvas, x: float, y: float, w: float, h: float, rows: List[Dict[str, Any]]) -> None:
+        header_h = 28
+        row_h = 30
+        rounded_rect(canvas, x, y, x + w, y + h, 10, C["panel2"], C["border"])
+        headers = ["Application", "Instances", "CPU", "Mem %", "Memory (RSS)", "Read", "Write"]
+        widths = [0.24, 0.10, 0.13, 0.13, 0.14, 0.13, 0.13]
+        cx = x
+        for head, frac in zip(headers, widths):
+            canvas.create_text(cx + 10, y + 15, text=head, fill=C["text"], font=(FONT, 8, "bold"), anchor="w")
+            cx += w * frac
+            canvas.create_line(cx, y, cx, y + h, fill="#202b3c")
+        canvas.create_line(x, y + header_h, x + w, y + header_h, fill=C["border"])
+        max_rows = int((h - header_h - 8) // row_h)
+        rows = rows[:max_rows]
+        app_icons = {
+            "firefox": "●",
+            "brave": "●",
+            "code": "◆",
+            "python": "◆",
+            "spotify": "●",
+            "discord": "●",
+            "terminal": "▣",
+            "bash": "▣",
+        }
+        for idx, row in enumerate(rows):
+            ry = y + header_h + idx * row_h
+            if idx % 2 == 0:
+                canvas.create_rectangle(x + 1, ry, x + w - 1, ry + row_h, fill="#151d2b", outline="")
+            name = str(row.get("name", "?"))
+            instances = str(row.get("count", 1))
+            cpu = safe_float(row.get("cpu"))
+            mem_pct = safe_float(row.get("mem_pct"))
+            rss = safe_int(row.get("rss_kb"))
+            read_b = safe_float(row.get("read_bytes"))
+            write_b = safe_float(row.get("write_bytes"))
+            
+            vals = [name, instances, f"{cpu:.1f}%", f"{mem_pct:.1f}%", fmt_kb(rss), fmt_bytes(read_b), fmt_bytes(write_b)]
+            cx = x
+            for col, (val, frac) in enumerate(zip(vals, widths)):
+                if col == 0:
+                    icon = next((ic for key, ic in app_icons.items() if key in name.lower()), "●")
+                    color = [C["purple"], C["cyan"], C["pink"], C["mint"], C["amber"]][idx % 5]
+                    canvas.create_text(cx + 12, ry + row_h / 2, text=icon, fill=color, font=(FONT, 10, "bold"), anchor="w")
+                    canvas.create_text(cx + 32, ry + row_h / 2, text=val[:34], fill=C["text"], font=(FONT, 9), anchor="w")
+                elif col == 2:
+                    canvas.create_text(cx + 10, ry + row_h / 2, text=val, fill=C["purple2"], font=(FONT, 8), anchor="w")
+                    bar(canvas, cx + 64, ry + 10, max(w * frac - 76, 20), 7, cpu, C["purple"])
+                elif col == 3:
+                    canvas.create_text(cx + 10, ry + row_h / 2, text=val, fill=C["text"], font=(FONT, 8), anchor="w")
+                    bar(canvas, cx + 64, ry + 10, max(w * frac - 76, 20), 7, mem_pct, C["blue"])
+                else:
+                    canvas.create_text(cx + 10, ry + row_h / 2, text=val, fill=C["text"], font=(FONT, 8), anchor="w")
+                cx += w * frac
 
     def draw_applications(self) -> None:
         canvas = self.canvas_pages["applications"]
@@ -1093,8 +1354,9 @@ class ModernMonitorApp(tk.Tk):
         h = max(canvas.winfo_height(), 700)
         m = 24
         draw_panel(canvas, m, 24, w - 2 * m, h - 48, "Applications", "▦")
-        canvas.create_text(m + 20, 66, text="Procesos principales ordenados por CPU usando el comando ps + /proc/<pid>/io", fill=C["muted"], font=(FONT, 9), anchor="w")
-        self._draw_process_table(canvas, m + 18, 96, w - 2 * m - 36, h - 150, self.processes[:22], compact=False)
+        canvas.create_text(m + 20, 66, text="Aplicaciones del usuario actual agrupadas por ejecutable. Filtra hilos del kernel y procesos del sistema.", fill=C["muted"], font=(FONT, 9), anchor="w")
+        user_apps = self._get_aggregated_applications()
+        self._draw_applications_table(canvas, m + 18, 96, w - 2 * m - 36, h - 150, user_apps)
 
     def draw_processes(self) -> None:
         canvas = self.canvas_pages["processes"]
@@ -1103,7 +1365,7 @@ class ModernMonitorApp(tk.Tk):
         h = max(canvas.winfo_height(), 700)
         m = 24
         draw_panel(canvas, m, 24, w - 2 * m, h - 48, "Processes", "▤")
-        canvas.create_text(m + 20, 66, text="PID, nombre, estado y usuario propietario. Datos cruzados con /proc y ps.", fill=C["muted"], font=(FONT, 9), anchor="w")
+        canvas.create_text(m + 20, 66, text="Todos los procesos activos del sistema (usuario y kernel/root) sin agrupar. Datos leídos de /proc y ps.", fill=C["muted"], font=(FONT, 9), anchor="w")
         self._draw_process_table(canvas, m + 18, 96, w - 2 * m - 36, h - 150, self.processes[:24], compact=False)
 
     def _draw_process_table(self, canvas: tk.Canvas, x: float, y: float, w: float, h: float, rows: List[Dict[str, Any]], compact: bool = True) -> None:
@@ -1219,20 +1481,52 @@ class ModernMonitorApp(tk.Tk):
         label = self.label_entry.get().strip() or "captura"
         comment = self.comment_entry.get().strip()
         record_id = self.db.create(self.latest, label, comment)
-        self.refresh_records()
+        self.refresh_records(select_id=record_id)
         messagebox.showinfo("CRUD", f"Captura registrada. ID: {record_id}")
 
-    def refresh_records(self) -> None:
+    def refresh_records(self, select_id: Optional[int] = None) -> None:
         if not hasattr(self, "records_tree"):
             return
-        self.records_tree.delete(*self.records_tree.get_children())
-        for row in self.db.list_all():
-            _id, created, label, _comment, cpu, mem, swap, disk, down, up = row
-            self.records_tree.insert("", "end", values=(_id, created, label, f"{cpu:.1f}", f"{mem:.1f}", f"{swap:.1f}", f"{disk:.1f}", fmt_bytes(down) + "/s", fmt_bytes(up) + "/s"))
+        
+        # Save selection target
+        target_id = select_id if select_id is not None else self.selected_record
+        
+        # Temporarily unbind <<TreeviewSelect>> to avoid spurious event cycles while rebuilding
+        self.records_tree.bind("<<TreeviewSelect>>", "")
+        
+        try:
+            self.records_tree.delete(*self.records_tree.get_children())
+            selected_iid = None
+            for row in self.db.list_all():
+                _id, created, label, _comment, cpu, mem, swap, disk, down, up = row
+                iid = self.records_tree.insert("", "end", values=(_id, created, label, f"{cpu:.1f}", f"{mem:.1f}", f"{swap:.1f}", f"{disk:.1f}", fmt_bytes(down) + "/s", fmt_bytes(up) + "/s"))
+                if target_id is not None and _id == target_id:
+                    selected_iid = iid
+            
+            if selected_iid:
+                self.records_tree.selection_set(selected_iid)
+                self.records_tree.see(selected_iid)
+                self.selected_record = target_id
+            else:
+                self.selected_record = None
+                self.label_entry.delete(0, "end")
+                self.comment_entry.delete(0, "end")
+                self.record_detail.delete("1.0", "end")
+        finally:
+            # Rebind <<TreeviewSelect>>
+            self.records_tree.bind("<<TreeviewSelect>>", self.select_record)
+            
+        # Manually trigger select_record to update detail view and entry fields
+        if selected_iid:
+            self.select_record(None)
 
     def select_record(self, _event: Any) -> None:
         selected = self.records_tree.selection()
         if not selected:
+            self.selected_record = None
+            self.label_entry.delete(0, "end")
+            self.comment_entry.delete(0, "end")
+            self.record_detail.delete("1.0", "end")
             return
         vals = self.records_tree.item(selected[0], "values")
         snapshot_id = safe_int(vals[0])
@@ -1246,7 +1540,7 @@ class ModernMonitorApp(tk.Tk):
         self.comment_entry.delete(0, "end")
         self.comment_entry.insert(0, str(comment))
         self.record_detail.delete("1.0", "end")
-        self.record_detail.insert("1.0", f"Registro #{_id} | {created}\nCPU {cpu:.1f}% · RAM {mem:.1f}% · Swap {swap:.1f}% · Disk {disk:.1f}%\nDown {fmt_bytes(down)}/s · Up {fmt_bytes(up)}/s\n\n{payload}")
+        self.record_detail.insert("1.0", f"Registro #{_id} | {created}\nEtiqueta: {label}\nComentario: {comment}\nCPU {cpu:.1f}% · RAM {mem:.1f}% · Swap {swap:.1f}% · Disk {disk:.1f}%\nDown {fmt_bytes(down)}/s · Up {fmt_bytes(up)}/s\n\n{payload}")
 
     def update_record(self) -> None:
         if self.selected_record is None:
