@@ -2,6 +2,10 @@
 
 Aplicación Python con UI dark profesional para monitorear recursos en Linux.
 
+# Video de presentación del proyecto
+
+https://drive.google.com/file/d/1ZrS1d1fW7-E5D4HA9OLq8vPORhDvM1XP/view?usp=sharing
+
 ## Ejecución en Arch / Garuda
 
 ```bash
